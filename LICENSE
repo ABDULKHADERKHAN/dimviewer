@@ -1,0 +1,25 @@
+DimViewer
+Copyright (c) 2026 Abdul Khader Khan <khaderkhan76@gmail.com>
+
+Required Notice: Copyright (c) 2026 Abdul Khader Khan
+
+This software is licensed under the PolyForm Noncommercial License 1.0.0.
+
+    SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
+    Full license text: https://polyformproject.org/licenses/noncommercial/1.0.0
+
+The full text at the address above is the license for this software and is
+included here by reference.
+
+In short (this summary is not the license; the full text governs):
+
+  - Free to use, copy, change and share for noncommercial purposes:
+    personal use, study, teaching, hobby projects and research, and use by
+    charities, schools, public research and government bodies.
+  - Any copy you pass on must keep this file and the "Required Notice" line.
+  - The software comes as is, with no warranty and no liability.
+  - Commercial use is not covered. For a commercial license, contact
+    Abdul Khader Khan <khaderkhan76@gmail.com>.
+
+Third-party libraries used by DimViewer keep their own licenses; see the
+NOTICE file and README.md.

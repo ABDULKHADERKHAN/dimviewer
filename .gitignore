@@ -1,0 +1,22 @@
+__pycache__/
+*.pyc
+.vscode/
+.venv/
+
+# Never commit part files, drawings or measurement data
+*.stl
+*.STL
+*.3mf
+*.amf
+*.step
+*.stp
+*.STEP
+*.sldprt
+*.SLDPRT
+*.prt
+*.prt.*
+*.svg
+*.pdf
+*.csv
+*.xlsx
+*.xls

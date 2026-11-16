@@ -1,0 +1,6 @@
+numpy
+vtk
+psutil
+# optional
+# cadquery-ocp    needed only to open STEP files
+# scipy   faster loading of very large meshes
