@@ -16,6 +16,7 @@ Files:    STL (binary or ASCII), 3MF, AMF. STEP if cadquery-ocp is installed.
 Run:      python main.py part.stl
           python main.py                          (opens a file dialog)
           python main.py part.3mf --report        (text only, no window)
+          python main.py part.stl --info          (feature counts for additive manufacturing)
           python main.py part.stl --csv features.csv
           python main.py part.stl --drawing part.html
 
@@ -26,6 +27,8 @@ How the code is organised
   main.py     this file: reads the command line and starts the window or a text output
   readers.py  turns STL / 3MF / AMF / STEP files into triangles
   model.py    finds surfaces and edges in the triangles and measures them (no graphics)
+  measure.py  angles, normal and centre distances, patterns, slots, wall thickness (no graphics)
+  dfam.py     part info for additive manufacturing: feature counts, thin walls, overhangs (no graphics)
   viewer.py   the window: 3D view, buttons, click-to-measure (uses VTK)
   drawing.py  the two-sheet drawing (views, feature dimensions, sections)
 """
@@ -36,7 +39,7 @@ from model import Model, Units, mem_mb
 from viewer import Viewer, ask_open
 
 # Copyright (c) 2026 Abdul Khader Khan. Free for noncommercial use; see README.md.
-__version__ = "0.1.0"
+__version__ = "0.3.1"
 __author__ = "Abdul Khader Khan"
 __email__ = "akhader6076@yahoo.in"          # questions and bug reports
 
@@ -57,6 +60,14 @@ def main():
                     help="drawing: also show overall sizes in the other unit, in brackets")
     ap.add_argument("--drawing", metavar="FILE",
                     help="write the two-sheet drawing, no window (.html = one file, .svg = one file per sheet)")
+    ap.add_argument("--info", action="store_true",
+                    help="print the part info for additive manufacturing (feature counts, thin walls, overhangs), no window")
+    ap.add_argument("--thin", type=float, default=1.0, metavar="MM",
+                    help="part info: walls and gaps under this many mm are flagged (default 1.0)")
+    ap.add_argument("--min-hole", type=float, default=1.0, metavar="MM",
+                    help="part info: holes under this diameter in mm are flagged (default 1.0)")
+    ap.add_argument("--overhang", type=float, default=45.0, metavar="DEG",
+                    help="part info: down-facing faces flatter than this from horizontal count as overhang (default 45)")
     ap.add_argument("--version", action="version",
                     version="DimViewer %s, by %s <%s>" % (__version__, __author__, __email__))
     args = ap.parse_args()
@@ -65,15 +76,19 @@ def main():
     except Exception:
         pass
 
-    if args.report or args.csv or args.drawing:
+    if args.report or args.csv or args.drawing or args.info:
         if not args.stl:
-            ap.error("--report, --csv and --drawing need a model file")
+            ap.error("--report, --info, --csv and --drawing need a model file")
         try:
             model = Model(args.stl, angle=args.angle)
         except (ValueError, RuntimeError, OSError) as exc:
             sys.exit(str(exc))
         if args.report:
             model.report(Units(model.units or args.units, args.display or args.units))
+        if args.info:
+            from dfam import part_info
+            print("\n".join(part_info(model, Units(model.units or args.units, args.display or args.units),
+                                      args.thin, args.min_hole, args.overhang)))
         if args.csv:
             model.write_csv(args.csv)
             print("Wrote " + args.csv)

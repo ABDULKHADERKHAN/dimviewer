@@ -673,8 +673,12 @@ class Model:
 
     def pick(self, cell, p, tol, mode="auto"):
         """Decide whether a click at point p on triangle `cell` hit an edge or a surface.
-        mode: auto (edge if the click is near one), edges, circles (nearest such edge), faces."""
+        mode: auto (edge if the click is near one), edges, circles (nearest such edge), faces,
+        points (nearest mesh corner). Returns ("surf", n), ("edge", n) or ("pt", vertex number)."""
         rid = int(self.labels[cell])
+        if mode == "points":                             # nearest corner of the clicked triangle
+            vid = self.F[cell]
+            return ("pt", int(vid[np.argmin(np.linalg.norm(self.V[vid] - p, axis=1))]))
         if mode == "faces":
             return ("surf", rid)
         cands = self.rchains[rid]
@@ -694,13 +698,16 @@ class Model:
 
     # -- descriptions --------------------------------------------------------
     def name(self, sel):
-        """Short name of a selection, such as S12 for a surface or E40 for an edge."""
-        return ("S%d" if sel[0] == "surf" else "E%d") % sel[1]
+        """Short name of a selection: S12 for a surface, E40 for an edge, P7 for a point."""
+        return {"surf": "S%d", "edge": "E%d", "pt": "P%d"}[sel[0]] % sel[1]
 
-    def describe(self, sel, U):
-        """Returns (title, detail lines, short label for the 3D view)."""
+    def describe(self, sel, U, thickness=True):
+        """Returns (title, detail lines, short label for the 3D view).
+        thickness=False skips the wall thickness behind a surface (slow for a full listing)."""
         if sel[0] == "edge":
             return self._describe_edge(sel[1], U)
+        if sel[0] == "pt":
+            return "P%d  POINT (mesh corner)" % sel[1], ["Position: " + U.P(self.V[sel[1]])], "Point"
         rid = sel[1]
         f = self.sfit(rid)
         k = f["kind"]
@@ -718,6 +725,8 @@ class Model:
             deg = math.degrees(f["span"])
             if f["full"]:
                 what = " (boss / shaft, external)" if f["external"] else " (hole, internal)"
+            elif deg < 135.0:
+                what = " (round, convex radius)" if f["external"] else " (fillet, concave radius)"
             else:
                 what = " (convex radius, external)" if f["external"] else " (concave radius, internal)"
             if f["full"] or deg > 180.5:
@@ -748,6 +757,8 @@ class Model:
             lines += ["Area: " + U.A(f["area"]),
                       "Extent X, Y, Z: %s, %s, %s" % (U.one(b[0]), U.one(b[1]), U.one(b[2]))]
             short = "Freeform"
+        from measure import extras
+        lines += extras(self, sel, U, thickness)
         lines.append("Y14.5 controls that apply:")
         lines += ["  " + s for s in GDT[k]]
         return "S%d  %s%s" % (rid, KIND_NAME[k], what), lines, short
@@ -790,20 +801,42 @@ class Model:
 
     # -- relation between two features ----------------------------------------
     def _geom(self, sel):
-        """Reduce a feature to what distance / angle maths needs: kind (plane, axis, point), a point, a direction, a length."""
+        """Reduce a feature to what distance / angle maths needs: kind (plane, axis, point), a point, a direction, a length.
+        A curved (freeform) face counts as a plane through its middle, facing its average
+        direction, and a curved edge as an axis along its general run, so that an angle and
+        a normal distance can always be given. _approx() tells when that was done."""
+        if sel[0] == "pt":
+            return "point", self.V[sel[1]], None, 0.0
         if sel[0] == "surf":
             f = self.sfit(sel[1])
             if f["kind"] == "plane":
                 return "plane", f["point"], f["normal"], 0.0
             if f["kind"] in ("cyl", "cone"):
                 return "axis", f["point"], f["axis"], f["length"]
+            if f["kind"] == "free":
+                tris = self.regs[sel[1]]
+                nb = (self.N[tris] * self.A[tris][:, None]).sum(0)
+                ln = float(np.linalg.norm(nb))
+                if ln > 0.3 * float(self.A[tris].sum()):         # the face looks mostly one way
+                    return "plane", f["point"], nb / ln, 0.0
             return "point", f["point"], None, 0.0
         f = self.efit(sel[1])
         if f["kind"] == "line":
             return "axis", f["point"], f["dir"], f["length"]
         if f["kind"] in ("circle", "arc"):
             return "axis", f["point"], f["dir"], 0.0
+        P = np.concatenate(self.segs(sel[1]))
+        Q = P - P.mean(0)
+        w, v = np.linalg.eigh(Q.T @ Q)
+        if w[1] < 0.09 * w[2]:                                   # a curved edge that still runs one way
+            return "axis", f["point"], v[:, 2], float(np.ptp(Q @ v[:, 2]))
         return "point", f["point"], None, 0.0
+
+    def _approx(self, sel):
+        """True if _geom() had to stand in an average direction for this feature (curved face or edge)."""
+        if sel[0] == "surf":
+            return self.sfit(sel[1])["kind"] == "free"
+        return sel[0] == "edge" and self.efit(sel[1])["kind"] == "polyline"
 
     def _verts(self, sel):
         """All vertices of a selected surface (None for an edge)."""
@@ -817,6 +850,9 @@ class Model:
             if sel[0] == "surf":
                 T = self.V[self.F[self.regs[sel[1]]]]
                 return (lambda p: _closest_on_tris(p, T)), np.concatenate([T.reshape(-1, 3), T.mean(1)])
+            if sel[0] == "pt":
+                v = self.V[sel[1]]
+                return (lambda p: (float(np.linalg.norm(p - v)), v)), v[None, :]
             s0, s1 = self.segs(sel[1])
             return (lambda p: _closest_on_segs(p, s0, s1)), np.concatenate([s0, s1, (s0 + s1) / 2.0])
 
@@ -851,6 +887,8 @@ class Model:
         def pts(sel):
             if sel[0] == "surf":
                 return self.V[np.unique(self.F[self.regs[sel[1]]])]
+            if sel[0] == "pt":
+                return self.V[[sel[1]]]
             return np.concatenate(self.segs(sel[1]))
         Pa, Pb = pts(a), pts(b)
         ax = int(np.argmax(np.abs(Pb.mean(0) - Pa.mean(0))))
@@ -862,68 +900,9 @@ class Model:
         return ax, float(p_hi[ax] - p_lo[ax]), (inside if inside > 1e-9 * self.diag else None), p_lo, p_hi
 
     def relate(self, a, b, U):
-        """Distance / angle of feature b relative to feature a (a acts as the reference)."""
-        ta, pa, da, _ = self._geom(a)
-        tb, pb, db, Lb = self._geom(b)
-        par, near1 = math.sin(math.radians(0.5)), math.cos(math.radians(0.5))
-        w = pb - pa
-        out = []
-        if ta == "plane" and tb == "plane":
-            c = min(1.0, abs(float(da @ db)))
-            ang = math.degrees(math.acos(c))
-            Pb = self._verts(b)
-            if c > near1:
-                out.append("Parallel planes, distance: " + U.L(abs(float(w @ da))))
-                out.append("Parallelism to reference, measured: " + U.L(float(np.ptp(Pb @ da))))
-            else:
-                out.append("Angle between planes (normals): %.2f%s" % (ang, DEG))
-                if c < par:
-                    m = db - (db @ da) * da
-                    m /= np.linalg.norm(m)
-                    out.append("Perpendicularity to reference, measured: " + U.L(float(np.ptp(Pb @ m))))
-        elif {ta, tb} == {"plane", "axis"}:
-            pn, pp = (da, pa) if ta == "plane" else (db, pb)
-            ad, ap, AL = (db, pb, Lb) if ta == "plane" else (da, pa, 0.0)
-            s = min(1.0, abs(float(ad @ pn)))
-            if s < par:
-                out.append("Axis parallel to plane, distance: " + U.L(abs(float((ap - pp) @ pn))))
-                if AL:
-                    out.append("Parallelism of axis, measured: " + U.L(AL * s))
-            elif s > near1:
-                out.append("Axis perpendicular to plane")
-                out.append("Feature center to plane: " + U.L(abs(float((ap - pp) @ pn))))
-                if AL:
-                    out.append("Perpendicularity of axis, measured: %s%s"
-                               % (DIA, U.L(AL * math.sqrt(max(0.0, 1 - s * s)))))
-            else:
-                out.append("Angle between axis and plane: %.2f%s" % (math.degrees(math.asin(s)), DEG))
-        elif ta == "axis" and tb == "axis":
-            c = min(1.0, abs(float(da @ db)))
-            if c > near1:
-                off = w - (w @ da) * da
-                dist = float(np.linalg.norm(off))
-                if dist <= 1e-5 * self.diag:
-                    out.append("Coaxial (axis offset %s)" % U.L(dist))
-                else:
-                    out.append("Parallel axes, center distance: " + U.L(dist))
-                    out.append("Offset X, Y, Z: %s, %s, %s"
-                               % (U.one(abs(off[0])), U.one(abs(off[1])), U.one(abs(off[2]))))
-            else:
-                cr = np.cross(da, db)
-                out.append("Angle between axes: %.2f%s" % (math.degrees(math.acos(c)), DEG))
-                out.append("Closest distance between axes: "
-                           + U.L(abs(float(w @ cr)) / float(np.linalg.norm(cr))))
-        elif "plane" in (ta, tb):
-            pn = da if ta == "plane" else db
-            out.append("Distance, point to plane: " + U.L(abs(float(w @ pn))))
-        elif "axis" in (ta, tb):
-            ad = da if ta == "axis" else db
-            out.append("Distance, point to axis: " + U.L(float(np.linalg.norm(w - (w @ ad) * ad))))
-        else:
-            out.append("Distance between centers: " + U.L(float(np.linalg.norm(w))))
-            out.append("Offset X, Y, Z: %s, %s, %s"
-                       % (U.one(abs(w[0])), U.one(abs(w[1])), U.one(abs(w[2]))))
-        return out
+        """Distance, angle and Y14.5-style relation of feature b to feature a (a is the reference)."""
+        from measure import relate
+        return relate(self, a, b, U)
 
     # -- text outputs --------------------------------------------------------
     def summary(self, U):
@@ -943,13 +922,23 @@ class Model:
         out("Surfaces: " + ", ".join("%d %s" % (n, KIND_NAME[k].lower()) for k, n in sorted(counts.items())))
         out("")
         for i in range(len(self.regs)):
-            title, lines, _ = self.describe(("surf", i), U)
+            title, lines, _ = self.describe(("surf", i), U, thickness=len(self.F) <= 20000)
             cut = lines.index("Y14.5 controls that apply:")
             out("%-44s %s" % (title, " | ".join(lines[:cut])))
         out("")
         for c in range(len(self.chains)):
             title, lines, _ = self.describe(("edge", c), U)
             out("%-24s %s" % (title, " | ".join(lines)))
+        from measure import patterns, pattern_text, slots
+        pats, sl = patterns(self), slots(self)
+        if pats or sl:
+            out("")
+        for g in pats:
+            out("Pattern: %s   (%s)" % (pattern_text(g, U), ", ".join("S%d" % i for i in g["ids"])))
+        for q in sl:
+            out("%s S%d + S%d: width %s, length %s, end centres %s apart"
+                % ("Obround boss" if q["external"] else "Slot", q["ids"][0], q["ids"][1],
+                   U.one(q["width"]), U.one(q["length"]), U.L(q["centres"])))
 
     def write_csv(self, path):
         """Write every surface and edge to a CSV file, in model units."""

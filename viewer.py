@@ -7,7 +7,7 @@ import os
 
 import numpy as np
 
-from model import Model, Units, mem_mb
+from model import DEG, Model, Units, mem_mb
 from readers import FILE_TYPES
 
 HELP = """Left-drag rotate, wheel zoom
@@ -15,14 +15,25 @@ Middle-drag or Shift+drag pan
 Click: measure edge or surface
 Shift+click: second feature
 Measure button (T): click two features
-  for the shortest distance between them
+  for angle, shortest distance and
+  normal distance between them
 Caliper button (K): same two clicks, but
   shows the outside length across both
+Thickness button (X): colour the part
+  by wall thickness
+Points: click picks a corner point
+Wireframe (F): edges only, faces clear
+Mesh (W): show the triangles
+Part info (A): feature counts, thin
+  walls, overhangs, in the log bar
+Copy log (L), Save log (S): take the
+  log bar text to the clipboard or a file
 Space: measure under the cursor
 Keys: 1-7 views, R fit, U units
 I model info, M model units
 G save a drawing (2 sheets)
-D datum A (reference feature)
+D: picked feature becomes datum A;
+  later picks are related to it
 O open, Esc clear, Q quit"""
 
 # on-screen buttons, top row first, right-aligned: (label, action); action None = plain text
@@ -30,8 +41,10 @@ BUTTONS = [
     [("View:", None), ("Front", "1"), ("Back", "2"), ("Top", "3"), ("Bottom", "4"),
      ("Right", "5"), ("Left", "6"), ("Iso", "7"), ("Fit", "r"), ("Open", "o"), ("Drawing", "g"), ("Info", "i"), ("Keys", "h")],
     [("Select:", None), ("Auto", "sel:auto"), ("Edges", "sel:edges"), ("Faces", "sel:faces"),
-     ("Circles", "sel:circles"), ("mm/in", "u"), ("Wire", "w"), ("Colour", "c"),
-     ("Axes", "b"), ("Edge lines", "e"), ("Measure", "t"), ("Caliper", "k")],
+     ("Circles", "sel:circles"), ("Points", "sel:points"), ("mm/in", "u"), ("Wireframe", "f"), ("Mesh", "w"),
+     ("Colour", "c"), ("Axes", "b"), ("Edge lines", "e")],
+    [("Measure:", None), ("Measure", "t"), ("Caliper", "k"), ("Datum A", "d"), ("Thickness", "x"),
+     ("Part info", "a"), ("Copy log", "l"), ("Save log", "s")],
 ]
 
 VIEWS = {"1": ((0, -1, 0), (0, 0, 1)), "2": ((0, 1, 0), (0, 0, 1)),
@@ -98,6 +111,16 @@ class Viewer:
         self.measure = False                             # Measure mode: clicks alternate feature 1, feature 2
         self.caliper = False                             # draw the outside (caliper) length, not the shortest gap
         self._gap = (None, None)                         # cached shortest distance for the current pair
+        self.thick = False                               # colour the part by wall thickness
+        self.frame = False                               # wireframe: feature edges only, faces ghosted
+        self.adv = False                                 # log bar shows the part info, not the selection
+        self._adv = (None, None)                         # cached part info text
+        self.log_full = ""                               # everything in the log bar, for Copy and Save
+        self.note = ""                                   # one-off message on the top line of the log bar
+        self._info_rows = 0
+        self._log_rows = (0, 19)
+        self._shift = 0.0                                # share of the window height taken by the log bar
+        self._thick_note = ""
         self.by_type = False
         self.show_help = False
         self.show_info = False                           # model data block, toggled by Info
@@ -131,6 +154,18 @@ class Viewer:
                           self._line_actor(DATUM, 4.0)]
         # top left: file name. bottom left: model data, with the picked feature above it.
         # top right: buttons (and the key list under them when Keys is on).
+        # The log bar's background has to be created before its text: VTK draws flat items in
+        # the order they were added, so anything added later lands on top.
+        self.log_poly = vtk.vtkPolyData()
+        lm = vtk.vtkPolyDataMapper2D()
+        lm.SetInputData(self.log_poly)
+        self.log_back = vtk.vtkActor2D()
+        self.log_back.SetMapper(lm)
+        self.log_back.GetProperty().SetColor(0.05, 0.06, 0.08)
+        self.log_back.GetProperty().SetOpacity(1.0)
+        self.log_back.SetLayerNumber(0)
+        self.log_back.SetVisibility(0)
+        self._add(self.log_back)
         self.t_title = self._text(0.01, 0.985, top=True, size=17)
         self.t_info = self._text(0.01, 0.01)
         self.t_sel = self._text(0.01, 0.01, color=(1.0, 0.86, 0.55))
@@ -262,14 +297,15 @@ class Viewer:
         vp = self.vtk.vtkPoints()
         vp.SetData(self.n2v(np.array(quads, np.float32), deep=True))
         self.btn_poly.SetPoints(vp)
-        self.t_help.GetPositionCoordinate().SetValue(W - 12, H - 80)
+        self.t_help.GetPositionCoordinate().SetValue(W - 12, H - 16 - 32 * len(BUTTONS))
 
     def _button_on(self, act):
         """Whether a button should be shown lit."""
         if act.startswith("sel:"):
             return self.mode == act[4:]
         return {"u": self.U.display == "in", "w": self.wire, "c": self.by_type, "b": self.show_axes,
-                "e": self.show_edges, "h": self.show_help, "i": self.show_info, "t": self.measure, "k": self.caliper}.get(act, False)
+                "e": self.show_edges, "h": self.show_help, "i": self.show_info, "t": self.measure, "k": self.caliper,
+                "x": self.thick, "d": self.datum is not None, "a": self.adv, "f": self.frame}.get(act, False)
 
     def _paint_buttons(self):
         """Colour each button by whether it is on."""
@@ -472,8 +508,7 @@ class Viewer:
         cam.SetFocalPoint(*c)
         cam.SetPosition(*(c + d * max(self.model.diag, 1e-9) * 3.0))
         cam.SetViewUp(*up)
-        self.ren.ResetCamera()
-        self.ren.ResetCameraClippingRange()
+        self.fit()
         self.rw.Render()
 
     def _recolor(self):
@@ -481,7 +516,10 @@ class Viewer:
         m = self.model
         col = np.empty((len(m.F), 3), np.uint8)
         col[:] = BASE
-        if (self.by_type or self.mode == "faces") and not m.lazy:
+        self._thick_note = ""
+        if self.thick:
+            col[:] = self._thickness_colours()
+        elif (self.by_type or self.mode == "faces") and not m.lazy:
             lut = np.array([TYPECOL[m.sfit(i)["kind"]] for i in range(len(m.regs))], np.uint8)
             col[:] = lut[m.labels]
         for s, rgb in ((self.datum, DATUM), (self.sel2, SEL2), (self.sel, SEL)):
@@ -490,6 +528,32 @@ class Viewer:
         arr = self.n2v(col, deep=True, array_type=self.vtk.VTK_UNSIGNED_CHAR)
         arr.SetName("colors")
         self.poly.GetCellData().SetScalars(arr)
+
+    def _thickness_colours(self):
+        """One colour per triangle for the wall thickness map: red is thin, blue is thick.
+        Also writes the legend text. The scale stops at the 95th percentile so that a few
+        very thick places do not wash out the rest."""
+        from measure import thickness_map
+        m, U = self.model, self.U
+        t, measured = thickness_map(m)
+        good = np.isfinite(t)
+        col = np.empty((len(t), 3), np.uint8)
+        col[:] = BASE
+        if not good.any():
+            self._thick_note = "Wall thickness: nothing to measure (open or flat mesh)"
+            return col
+        lo, hi = float(t[good].min()), float(np.percentile(t[good], 95))
+        f = np.clip((t[good] - lo) / max(hi - lo, 1e-12), 0.0, 1.0)
+        stops = np.array([(215, 48, 39), (253, 174, 97), (255, 255, 160), (116, 196, 118), (49, 104, 189)], float)
+        x = f * (len(stops) - 1)
+        i = np.minimum(x.astype(np.int64), len(stops) - 2)
+        col[good] = (stops[i] + (stops[i + 1] - stops[i]) * (x - i)[:, None]).astype(np.uint8)
+        self._thick_note = ("Wall thickness map: red %s (thinnest), yellow %s, blue %s and above"
+                            % (U.one(lo), U.one((lo + hi) / 2.0), U.L(hi)))
+        if measured < len(t):
+            self._thick_note += "\n    measured at %s of %s triangles, the rest taken from the nearest" % (
+                format(measured, ","), format(len(t), ","))
+        return col
 
     def update(self):
         """Redraw everything that depends on the current selection, mode, units and toggles."""
@@ -504,10 +568,13 @@ class Viewer:
         self._recolor()
         self._paint_buttons()
         all_edges = self.mode == "edges"                 # Edges mode: every edge lit up
+        frame = self.frame and len(m.feat) > 0           # wireframe needs recognised edges
         pr = self.edge_actor.GetProperty()
-        pr.SetColor(*((0.25, 0.90, 1.0) if all_edges else (0.14, 0.15, 0.18)))
-        pr.SetLineWidth(3.0 if all_edges else 1.5)
-        self.edge_actor.SetVisibility(1 if (len(m.feat) and (self.show_edges or all_edges)) else 0)
+        pr.SetColor(*((0.25, 0.90, 1.0) if all_edges else (0.92, 0.94, 0.97) if frame else (0.14, 0.15, 0.18)))
+        pr.SetLineWidth(3.0 if all_edges else 2.0 if frame else 1.5)
+        self.edge_actor.SetVisibility(1 if (len(m.feat) and (self.show_edges or all_edges or frame)) else 0)
+        # the faces stay in the scene, almost clear, so that clicking still finds them
+        self.mesh_actor.GetProperty().SetOpacity(0.07 if frame else 1.0)
         if self.mode == "circles" and self.circ_actor is None:
             self.circ_actor = self._line_actor((255, 225, 60), 4.0)
             cc = m.circle_chains()
@@ -526,32 +593,38 @@ class Viewer:
                 actor.SetVisibility(1)
             else:
                 actor.SetVisibility(0)
-        txt = []
+        sections = []                                    # blocks of text; the log bar sets them side by side
         for tag, s, p, lab in (("1", self.sel, self.p1, self.labels[0]),
                                ("2", self.sel2, self.p2, self.labels[1])):
             if not s:
                 lab.SetVisibility(0)
                 continue
             title, lines, short = m.describe(s, U)
-            txt.append("[%s] %s" % (tag, title))
-            txt += ["    " + ln for ln in lines]
+            if self.sel2 and "Y14.5 controls that apply:" in lines:      # two features: keep the text short
+                lines = lines[:lines.index("Y14.5 controls that apply:")]
+            if s[0] == "pt":
+                p = m.V[s[1]]                            # label sits on the corner itself
+            sections.append(["[%s] %s" % (tag, title)] + ["  " + ln for ln in lines])
             lab.SetInput(" %s " % short)
             lab.GetPositionCoordinate().SetValue(float(p[0]), float(p[1]), float(p[2]))
             lab.SetVisibility(1)
         if self.sel and self.sel2 and self.sel != self.sel2:
+            from measure import headline, symmetry
             if self._gap[0] != (self.sel, self.sel2):
                 self._gap = ((self.sel, self.sel2), m.closest(self.sel, self.sel2))
             dist, pa, pb = self._gap[1]
-            txt.append("[1] to [2]:")
-            txt.append("    Shortest distance: " + U.L(dist))
-            if dist > 1e-9 * m.diag:
-                dv = np.abs(pb - pa)
-                txt.append("    Along X, Y, Z: %s, %s, %s" % (U.one(dv[0]), U.one(dv[1]), U.one(dv[2])))
+            head = headline(m, self.sel, self.sel2, U, self._gap[1])
+            res = ["RESULT  [1] to [2]"] + ["  %-18s %s" % (k + ":", val) for k, val in head]
             ax, outside, inside, p_lo, p_hi = m.caliper(self.sel, self.sel2)
-            txt.append("    Caliper, outside along %s: %s" % ("XYZ"[ax], U.L(outside)))
-            if inside is not None:
-                txt.append("    Caliper, inside along %s: %s" % ("XYZ"[ax], U.L(inside)))
-            txt += ["    " + ln for ln in m.relate(self.sel, self.sel2, U)]
+            res.append("  %-18s %s outside along %s%s" % ("Caliper:", U.L(outside), "XYZ"[ax],
+                                                        "" if inside is None else ", %s inside" % U.L(inside)))
+            sections.insert(0, res)                      # the result comes first, then the two features
+            more = [ln for ln in m.relate(self.sel, self.sel2, U)       # leave out what the result already says
+                    if not ln.startswith(("Angle between", "Normal distance, centre of [2]", "Feature centre to plane"))]
+            if self.datum and self.datum not in (self.sel, self.sel2):
+                more += symmetry(m, self.datum, self.sel, self.sel2, U)
+            if more:
+                sections.insert(1, ["MORE ON THIS PAIR"] + ["  " + ln for ln in more])
             if self.caliper:                             # measuring line along the axis, then the jaw to the far point
                 end = p_lo.copy()
                 end[ax] = p_hi[ax]
@@ -561,22 +634,180 @@ class Viewer:
                 self.gap_actor.GetMapper().SetInputData(self._seg_poly(pa[None, :], pb[None, :]))
                 mid = (pa + pb) / 2.0
             self.gap_actor.SetVisibility(1)
-            self.gap_label.SetInput(" %s " % U.one(dist))
+            angle = head[0][1].split(DEG)[0] + DEG if DEG in head[0][1] else ""
+            self.gap_label.SetInput(" %s%s " % (U.one(dist), "   angle " + angle if angle else ""))
             self.gap_label.GetPositionCoordinate().SetValue(float(mid[0]), float(mid[1]), float(mid[2]))
             self.gap_label.SetVisibility(1)
         else:
             self.gap_actor.SetVisibility(0)
             self.gap_label.SetVisibility(0)
             if self.measure:
-                txt.append("Measure: click the %s feature" % ("second" if self.sel else "first"))
+                sections.append(["Measure: click the %s feature" % ("second" if self.sel else "first")])
+        if self._thick_note:
+            sections.append(self._thick_note.split("\n"))
         if self.datum:
-            txt.append("Datum A = %s" % m.name(self.datum))
+            d = ["Datum A = %s" % m.name(self.datum)]
             if self.sel and self.sel != self.datum:
-                txt += ["    " + ln for ln in m.relate(self.datum, self.sel, U)]
-        self.t_sel.SetInput("\n".join(txt))
+                d += ["  " + ln for ln in m.relate(self.datum, self.sel, U)]
+            sections.append(d)
+        if self.adv:
+            sections, part = [], []
+            for ln in self._part_info():                 # blank lines separate the blocks
+                if ln:
+                    part.append(ln)
+                elif part:
+                    sections.append(part)
+                    part = []
+            if part:
+                sections.append(part)
+        self._show_log(sections)
         self.t_help.SetInput(HELP if self.show_help else "")
         self._info()
+        self._make_room()
         self.rw.Render()
+
+    # -- log bar -------------------------------------------------------------
+    def _part_info(self):
+        """Part info lines for the open model (worked out once per model and unit)."""
+        key = (id(self.model), self.U.model, self.U.display)
+        if self._adv[0] != key:
+            from dfam import part_info
+            a = self.args
+            try:
+                lines = part_info(self.model, self.U, getattr(a, "thin", 1.0), getattr(a, "min_hole", 1.0),
+                                  getattr(a, "overhang", 45.0))
+            except Exception as exc:
+                lines = ["Part info could not be worked out: %s" % exc]
+            self._adv = (key, lines)
+            print("\n".join(lines))                      # the terminal gets a copy as well
+        return self._adv[1]
+
+    def _show_log(self, sections):
+        """Put blocks of text in the log bar at the bottom. The blocks are set side by side in
+        as many columns as the window is wide enough for, so the bar stays low on a wide window
+        and the part stays visible. Text that still does not fit is cut on screen only:
+        Copy log and Save log always give all of it."""
+        import textwrap
+        sections = [list(b) for b in sections if b]
+        self.log_full = "\n\n".join("\n".join(b) for b in sections)   # the note below is shown but not copied
+        if self.note:
+            sections.insert(0, [self.note])
+        W, H = (self._size or (1280, 820))
+        size = 13
+        pitch, charw = size + 4, 0.6 * size              # Courier: every letter is 0.6 of the font size wide
+        usable = int((0.85 * W - 24) / charw)            # the right-hand end is left to the X, Y, Z marker
+        ncol = max(1, min(len(sections), 3 if usable >= 180 else 2 if usable >= 100 else 1))
+        wrap = max(30, min(84, usable // ncol - 3))
+        blocks = []
+        for b in sections:
+            out = []
+            for ln in b:
+                pad = " " * (len(ln) - len(ln.lstrip()) + 4)
+                out += textwrap.wrap(ln, wrap, subsequent_indent=pad) or [""]
+            blocks.append(out)
+        total = sum(len(b) for b in blocks) + len(blocks) - 1
+        target = max(-(-total // ncol), max([len(b) for b in blocks] + [0]))
+        cols = [[]]
+        for b in blocks:                                 # fill column by column, keeping a block whole
+            if cols[-1] and len(cols[-1]) + 1 + len(b) > target and len(cols) < ncol:
+                cols.append([])
+            cols[-1] += ([""] if cols[-1] else []) + b
+        rows = max(len(c) for c in cols) if blocks else 0
+        most = max(3, int(0.45 * H) // pitch)            # the bar never takes more than 45% of the height
+        if rows > most:
+            cols = [c[:most - 1] + ["... more: use Copy log or Save log"] if len(c) > most else c for c in cols]
+            rows = most
+        widths = [max([len(ln) for ln in c] + [0]) + 3 for c in cols]
+        shown = ["".join((c[r] if r < len(c) else "").ljust(w) for c, w in zip(cols, widths)).rstrip()
+                 for r in range(rows)]
+        self.t_sel.GetTextProperty().SetFontSize(size)
+        self.t_sel.SetInput("\n".join(shown))
+        self._log_rows = (len(shown), pitch)
+
+    def _log_strip(self):
+        """Size the dark strip to the text now in the log bar."""
+        n, pitch = getattr(self, "_log_rows", (0, 19))
+        rows_px = n * pitch + 19 * self._info_rows
+        if rows_px == 0:
+            self.log_back.SetVisibility(0)
+            return
+        W = (self._size or (1280, 820))[0]
+        top = rows_px + 24
+        vp = self.vtk.vtkPoints()
+        vp.SetData(self.n2v(np.array([(0, 0, 0), (W, 0, 0), (W, top, 0), (0, top, 0)], np.float32), deep=True))
+        self.log_poly.SetPoints(vp)
+        if self.log_poly.GetNumberOfCells() != 1:
+            idt = np.int64 if self.vtk.vtkIdTypeArray().GetDataTypeSize() == 8 else np.int32
+            ca = self.vtk.vtkCellArray()
+            ca.SetCells(1, self.n2id(np.array([4, 0, 1, 2, 3], idt), deep=True))
+            self.log_poly.SetPolys(ca)
+        self.log_poly.Modified()
+        self.log_back.SetVisibility(1)
+
+    def _make_room(self):
+        """Move the picture of the part up so that it sits in the middle of the space above
+        the log bar, and zoom so that it keeps its size relative to that space."""
+        n, pitch = self._log_rows
+        H = (self._size or (1280, 820))[1]
+        px = n * pitch + 19 * self._info_rows
+        f = min(0.5, (px + 24) / float(H)) if px else 0.0
+        if abs(f - self._shift) < 1e-6:
+            return
+        cam = self.ren.GetActiveCamera()
+        cam.SetParallelScale(cam.GetParallelScale() * (1.0 - self._shift) / (1.0 - f))
+        cam.SetWindowCenter(0.0, -f)                     # the view centre goes to the middle of the free area
+        self._shift = f
+
+    def fit(self):
+        """Zoom so that the whole part fits in the space above the log bar."""
+        self.ren.ResetCamera()
+        cam = self.ren.GetActiveCamera()
+        cam.SetParallelScale(cam.GetParallelScale() / (1.0 - self._shift))
+        self.ren.ResetCameraClippingRange()
+
+    def copy_log(self):
+        """Copy everything in the log bar to the clipboard. Returns True if it worked."""
+        import subprocess
+        import sys
+        text = self.log_full
+        try:
+            if sys.platform.startswith("win"):
+                subprocess.run(["clip"], input=text.encode("utf-16"), check=True)   # UTF-16 keeps the diameter and degree signs
+            elif sys.platform == "darwin":
+                subprocess.run(["pbcopy"], input=text.encode("utf-8"), check=True)
+            else:
+                subprocess.run(["xclip", "-selection", "clipboard"], input=text.encode("utf-8"), check=True)
+            return True
+        except Exception:
+            pass
+        try:
+            import tkinter as tk
+            root = tk.Tk()
+            root.withdraw()
+            root.clipboard_clear()
+            root.clipboard_append(text)
+            root.update()
+            root.destroy()
+            return True
+        except Exception:
+            return False
+
+    def save_log(self):
+        """Write the log bar text to <model name>_info.txt next to the model and open it.
+        Returns the path, or None if it could not be written."""
+        base = os.path.splitext(self.model.path)[0] if self.model else "dimviewer"
+        path = base + "_info.txt"
+        try:
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write(self.log_full + "\n")
+        except OSError:
+            return None
+        try:
+            if hasattr(os, "startfile"):
+                os.startfile(path)
+        except Exception:
+            pass
+        return path
 
     def _info(self):
         """File name top left (details on a second line). The model data block at the bottom
@@ -608,6 +839,8 @@ class Viewer:
             self.last_mem = mb
         self.t_info.SetInput("\n".join(lines))
         self.t_sel.GetPositionCoordinate().SetValue(12, 12 + 19 * len(lines) + (10 if lines else 0))
+        self._info_rows = len(lines)
+        self._log_strip()
 
     # -- events --------------------------------------------------------------
     def on_press(self, obj, event):
@@ -653,6 +886,8 @@ class Viewer:
         cam = self.ren.GetActiveCamera()
         tol = 8.0 * 2.0 * cam.GetParallelScale() / max(1, self.rw.GetSize()[1])
         hit = self.model.pick(int(self.picker.GetCellId()), p, tol, self.mode)
+        self.adv = False                                 # a pick puts the feature back in the log bar
+        self.note = ""
         if self.sel and (shift or (self.measure and not self.sel2)):
             self.sel2, self.p2 = hit, p
         else:
@@ -667,19 +902,21 @@ class Viewer:
 
     def do(self, k):
         """Carry out one action: a key press or an on-screen button."""
+        self.note = ""
         if k.startswith("sel:"):
             self.mode = k[4:]
         elif k in VIEWS:
             self.set_view(k)
         elif k == "r":
-            self.ren.ResetCamera()
-            self.ren.ResetCameraClippingRange()
+            self.fit()
         elif k == "u":
             self.U.display = "in" if self.U.display == "mm" else "mm"
         elif k == "m" and not (self.model and self.model.units):
             self.U.model = "in" if self.U.model == "mm" else "mm"
         elif k == "d":
             self.datum = None if (self.sel is None or self.sel == self.datum) else self.sel
+            if self.datum:                               # the next clicks start a fresh pair
+                self.sel = self.sel2 = None
         elif k == "e":
             self.show_edges = not self.show_edges
         elif k == "w" and self.mesh_actor is not None:
@@ -689,6 +926,10 @@ class Viewer:
                 pr.SetRepresentationToWireframe()
             else:
                 pr.SetRepresentationToSurface()
+        elif k == "f":
+            self.frame = not self.frame
+            if self.frame and self.model is not None and not len(self.model.feat):
+                self.note = "No edges were recognised on this model, so wireframe has nothing to show. Try Mesh."
         elif k == "c":
             self.by_type = not self.by_type
         elif k == "b":
@@ -705,6 +946,24 @@ class Viewer:
             if self.caliper and not self.measure:        # caliper needs two picks, so switch Measure on too
                 self.measure = True
                 self.sel = self.sel2 = None
+        elif k == "x":
+            self.thick = not self.thick
+            if self.thick and self.model is not None and not hasattr(self.model, "_tmap"):
+                self.t_sel.SetInput("Measuring wall thickness, please wait...")
+                self.rw.Render()
+        elif k == "a" and self.model is not None:
+            self.adv = not self.adv
+            if self.adv and self._adv[0] != (id(self.model), self.U.model, self.U.display):
+                self.t_sel.SetInput("Analysing the part, please wait...")
+                self.rw.Render()
+        elif k == "l":
+            n = self.log_full.count("\n") + 1 if self.log_full else 0
+            self.note = ("Copied %d lines to the clipboard." % n) if (n and self.copy_log()) else \
+                "Nothing copied (the log bar is empty or the clipboard is not available)."
+        elif k == "s":
+            saved = self.log_full
+            p = self.save_log() if saved else None
+            self.note = ("Saved the log to %s" % p) if p else "Nothing saved (the log bar is empty or the folder is read-only)."
         elif k == "g":
             self.save_drawing()
             return
